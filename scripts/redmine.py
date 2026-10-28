@@ -336,12 +336,42 @@ def cmd_search(rm, a):
                                      str(r.get("datetime", ""))[:10]))
 
 
+def guess_tracker(rm, subject, description):
+    """未指定 --tracker 时按标题/描述关键词自动选择；都不中默认「支持」。返回 (id, name)。"""
+    text = ("%s %s" % (subject, description or "")).lower()
+    trackers = list_trackers(rm)
+    by_name = {t["name"]: t["id"] for t in trackers}
+    rules = [
+        ("错误", ["bug", "缺陷", "报错", "错误", "异常", "崩溃", "闪退", "失败", "无法",
+                  "不能", "不生效", "不正确", "无效", "错乱", "修复", "故障", "黑屏",
+                  "白屏", "卡死", "卡顿", "死机", "泄露", "漏洞"]),
+        ("需求变更", ["需求变更", "需求修改", "需求调整"]),
+        ("功能", ["功能", "特性", "新增", "增加", "新需求", "开发", "适配", "迭代",
+                  "建设", "实现", "优化", "增强", "完善"]),
+    ]
+    for name, kws in rules:
+        if name in by_name and any(k in text for k in kws):
+            return by_name[name], name
+    if "支持" in by_name:
+        return by_name["支持"], "支持"
+    return (trackers[0]["id"], trackers[0]["name"]) if trackers else (None, None)
+
+
 def cmd_create(rm, a):
     issue = {"project_id": resolve_project(rm, a.project), "subject": a.subject}
+    if a.description and a.description_file:
+        die("--description 与 --description-file 只能用一个")
     if a.description:
         issue["description"] = a.description
+    elif a.description_file:
+        issue["description"] = read_text_file(a.description_file, "描述")
+    tracker_name = None
     if a.tracker:
         issue["tracker_id"] = match_name(list_trackers(rm), a.tracker, "跟踪类型")
+    else:
+        tid, tracker_name = guess_tracker(rm, a.subject, issue.get("description"))
+        if tid:
+            issue["tracker_id"] = tid
     if a.priority:
         issue["priority_id"] = match_name(list_priorities(rm), a.priority, "优先级")
     if a.assignee:
@@ -350,7 +380,8 @@ def cmd_create(rm, a):
         issue["status_id"] = match_name(list_statuses(rm), a.status, "状态")
     data = rm.req("POST", "/issues.json", payload={"issue": issue})
     i = data.get("issue", {})
-    out("已创建工单 #%s — %s" % (i.get("id"), i.get("subject")))
+    tname = (i.get("tracker") or {}).get("name") or tracker_name
+    out("已创建工单 #%s — %s（跟踪: %s）" % (i.get("id"), i.get("subject"), tname or "-"))
     out("URL: %s/issues/%s" % (rm.base, i.get("id")))
 
 
@@ -372,6 +403,17 @@ def upload_tokens(rm, files):
     return tokens
 
 
+def read_text_file(path, label):
+    """读取 UTF-8 文本文件作为长内容（兼容 BOM），规避 shell 对引号/多行的传参截断。"""
+    if not os.path.isfile(path):
+        die("%s文件不存在: %s" % (label, path))
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            return f.read()
+    except OSError as e:
+        die("读取失败: %s — %s" % (path, e))
+
+
 def cmd_update(rm, a):
     issue = {}
     if a.status:
@@ -388,10 +430,18 @@ def cmd_update(rm, a):
         issue["done_ratio"] = a.progress
     if a.subject:
         issue["subject"] = a.subject
+    if a.description and a.description_file:
+        die("--description 与 --description-file 只能用一个")
     if a.description is not None:
         issue["description"] = a.description
+    elif a.description_file:
+        issue["description"] = read_text_file(a.description_file, "描述")
+    if a.notes and a.notes_file:
+        die("-m 与 --notes-file 只能用一个")
     if a.notes:
         issue["notes"] = a.notes
+    elif a.notes_file:
+        issue["notes"] = read_text_file(a.notes_file, "评论")
     if a.file:
         issue["uploads"] = upload_tokens(rm, a.file)
     if not issue:
@@ -406,11 +456,23 @@ def cmd_update(rm, a):
 
 
 def cmd_note(rm, a):
-    issue = {"notes": a.notes}
+    notes = a.notes
+    if a.notes_file:
+        if notes:
+            die("-m 与 --notes-file 只能用一个")
+        notes = read_text_file(a.notes_file, "评论")
+    if not notes or not notes.strip():
+        die("评论内容为空 — 用 -m 短评论或 --notes-file 文件提供")
+    issue = {"notes": notes}
     if a.file:
         issue["uploads"] = upload_tokens(rm, a.file)
     rm.req("PUT", "/issues/%s.json" % a.id, payload={"issue": issue})
-    out("已在工单 #%s 添加评论%s" % (a.id, "并上传 %d 个附件" % len(a.file) if a.file else ""))
+    extra = []
+    if a.file:
+        extra.append("上传 %d 个附件" % len(a.file))
+    if a.notes_file:
+        extra.append("内容来自文件")
+    out("已在工单 #%s 添加评论%s" % (a.id, "（%s）" % "、".join(extra) if extra else ""))
 
 
 def cmd_close(rm, a):
@@ -455,6 +517,30 @@ def cmd_attach(rm, a):
         entry["description"] = a.description
     rm.req("PUT", "/issues/%s.json" % a.id, payload={"issue": {"uploads": [entry]}})
     out("已上传附件 %s 到工单 #%s" % (entry["filename"], a.id))
+
+
+def cmd_watchers(rm, a):
+    data = rm.req("GET", "/issues/%s.json" % a.id, {"include": "watchers"})
+    ws = (data.get("issue") or {}).get("watchers", [])
+    if not ws:
+        out("工单 #%s 没有跟踪者" % a.id)
+        return
+    out("工单 #%s 跟踪者 (%d):" % (a.id, len(ws)))
+    for w in ws:
+        out("  #%s %s" % (w.get("id"), w.get("name")))
+
+
+def cmd_watch(rm, a):
+    if not a.add and not a.remove:
+        die("请指定操作 — --add 添加跟踪者 / --remove 移除跟踪者（me / 用户id / 姓名）")
+    if a.add:
+        uid = resolve_assignee(rm, a.add)
+        rm.req("POST", "/issues/%s/watchers.json" % a.id, payload={"user_id": uid})
+        out("已添加跟踪者 %s 到工单 #%s" % (a.add, a.id))
+    if a.remove:
+        uid = resolve_assignee(rm, a.remove)
+        rm.req("DELETE", "/issues/%s/watchers/%s.json" % (a.id, uid))
+        out("已从工单 #%s 移除跟踪者 %s" % (a.id, a.remove))
 
 
 # ---------------------------------------------------------------- 入口
@@ -505,6 +591,8 @@ def build_parser():
     s.add_argument("--project", required=True, help="项目 id/名称/identifier")
     s.add_argument("--subject", required=True)
     s.add_argument("--description")
+    s.add_argument("--description-file", dest="description_file",
+                   help="描述长内容从 UTF-8 文件读入（多行/含双引号时用，避免 PowerShell 截断）")
     s.add_argument("--tracker")
     s.add_argument("--priority")
     s.add_argument("--assignee", help="me / 用户id / 姓名")
@@ -521,12 +609,16 @@ def build_parser():
     s.add_argument("--progress", type=int, help="完成度 0-100")
     s.add_argument("--subject")
     s.add_argument("--description")
+    s.add_argument("--notes-file", dest="notes_file", help="评论长内容从 UTF-8 文件读入（与 -m 互斥）")
+    s.add_argument("--description-file", dest="description_file", help="描述长内容从 UTF-8 文件读入（与 --description 互斥）")
     s.add_argument("--file", action="append", help="附件文件路径，可重复传多个")
     s.set_defaults(func=cmd_update)
 
     s = sub.add_parser("note", help="回票（只加评论）")
     s.add_argument("id")
-    s.add_argument("-m", "--notes", required=True)
+    s.add_argument("-m", "--notes", help="短评论（与 --notes-file 二选一）")
+    s.add_argument("--notes-file", dest="notes_file",
+                   help="评论长内容从 UTF-8 文件读入（多行/含双引号时必用，避免 PowerShell 截断）")
     s.add_argument("--file", action="append", help="附件文件路径，可重复传多个")
     s.set_defaults(func=cmd_note)
 
@@ -551,6 +643,16 @@ def build_parser():
     s.add_argument("--type", help="Content-Type，默认 application/octet-stream")
     s.add_argument("--description")
     s.set_defaults(func=cmd_attach)
+
+    s = sub.add_parser("watchers", help="查看工单跟踪者")
+    s.add_argument("id")
+    s.set_defaults(func=cmd_watchers)
+
+    s = sub.add_parser("watch", help="添加/移除跟踪者")
+    s.add_argument("id")
+    s.add_argument("--add", help="添加跟踪者（me / 用户id / 姓名）")
+    s.add_argument("--remove", help="移除跟踪者（me / 用户id / 姓名）")
+    s.set_defaults(func=cmd_watch)
 
     return p
 
