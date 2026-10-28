@@ -6,9 +6,12 @@
 
 ## 功能特性
 
-- 提票、回票、查票、关单、记工时、上传附件，一站搞定
+- 提票、回票、查票、关单、记工时、上传附件、管理跟踪者，一站搞定
 - 项目 / 跟踪类型 / 状态 / 优先级 / 负责人支持**名称模糊匹配**（中英文均可，如 `--status 进行中`、`--assignee me`）
 - 一次调用可同时提交字段更新 + 评论 + 多个附件
+- `create` 不指定跟踪类型时按标题/描述关键词自动选择（bug/报错 → 错误，功能/优化/建设 → 功能，需求变更 → 需求变更，默认支持）
+- 长内容（多行、含双引号）写入 UTF-8 文件后经 `--notes-file` / `--description-file` 传入，规避 PowerShell 传参截断
+- 跟踪者（Watchers）管理：查看工单跟踪者，支持 `me` / 用户 id / 姓名增删
 - 兼容自签名证书服务器（`--insecure`）
 - 凭据支持 命令行参数 / 环境变量 / 配置文件 三种方式，密钥不落盘到代码与仓库
 
@@ -66,6 +69,7 @@ python scripts/redmine.py --url https://redmine.example.com --key 你的KEY test
 - 「给 #123 回票：问题已修复，附上日志」
 - 「#123 关单，备注已完成」
 - 「给 #123 记 2 小时工时」
+- 「把张三加为 #123 的跟踪者」
 
 ### 直接调用脚本
 
@@ -79,7 +83,12 @@ python scripts/redmine.py note 123 -m "问题已修复" --file ./fix.log
 python scripts/redmine.py update 123 --status 已解决 --priority 高 --progress 80
 python scripts/redmine.py close 123 -m "已完成"
 python scripts/redmine.py log 123 --hours 2 --comments "联调测试"
+python scripts/redmine.py watchers 123                          # 查看跟踪者
+python scripts/redmine.py watch 123 --add me                    # 添加跟踪者
+python scripts/redmine.py watch 123 --remove zhangsan           # 移除跟踪者
 ```
+
+> 多行长评论 / 长描述（尤其含 ASCII 双引号时）不要拼进命令行 — PowerShell 5.1 会截断参数。写入 UTF-8 文本文件后用 `--notes-file 评论.txt`（评论）或 `--description-file 描述.txt`（描述）传入。
 
 ## 命令一览
 
@@ -90,12 +99,14 @@ python scripts/redmine.py log 123 --hours 2 --comments "联调测试"
 | `issues` | 查票，支持 `--project` `--status` `--assignee` `--tracker` `--priority` `--query` `--limit` `--sort` |
 | `issue <id>` | 单票详情（描述 + 评论历史） |
 | `search --q 关键词` | 全站全文搜索 |
-| `create` | 提票（`--project` `--subject` 必填，可选 `--description` `--tracker` `--priority` `--assignee`） |
-| `update <id>` | 更新字段 / 状态 / 评论 / 附件（可一次全部提交） |
-| `note <id>` | 回票（加评论，可同时传附件） |
+| `create` | 提票（`--project` `--subject` 必填；`--tracker` 缺省时按标题/描述关键词自动选择跟踪类型） |
+| `update <id>` | 更新字段 / 状态 / 评论 / 附件（可一次全部提交；长评论可用 `--notes-file`） |
+| `note <id>` | 回票（加评论，可同时传附件；长评论可用 `--notes-file`） |
 | `close <id>` | 关单（自动选用服务器的关闭态状态） |
 | `log <id>` | 记工时（`--hours` 必填，可选 `--activity` `--comments` `--spent-on`） |
 | `attach <id>` | 上传附件到工单 |
+| `watchers <id>` | 查看工单跟踪者 |
+| `watch <id>` | 添加 / 移除跟踪者（`--add` / `--remove`，支持 `me` / 用户 id / 姓名） |
 
 ## 说明
 
