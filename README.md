@@ -1,4 +1,4 @@
-# redmine-skill
+﻿# redmine-skill
 
 > 让 AI 助手替你打理 Redmine：提票、回票、查票、关单、记工时，一句话搞定。
 
@@ -14,6 +14,7 @@
 - 跟踪者（Watchers）管理：查看工单跟踪者，支持 `me` / 用户 id / 姓名增删
 - 兼容自签名证书服务器（`--insecure`）
 - 凭据支持 命令行参数 / 环境变量 / 配置文件 三种方式，密钥不落盘到代码与仓库
+- **支持多台 Redmine 服务器**：配置文件里按名字保存多套地址与密钥，`--server <名字>` 一键切换，`servers` 命令查看已配置项
 
 ## 安装
 
@@ -40,21 +41,31 @@ export REDMINE_API_KEY="你的API访问密钥"
 
 **方式二：配置文件** `~/.redmine/config.json`
 
+支持同时配置多台服务器，按名字切换：
+
 ```json
 {
-  "url": "https://redmine.example.com",
-  "key": "你的API访问密钥",
-  "insecure": false
+  "servers": {
+    "work":   {"url": "https://redmine.example.com", "key": "你的API访问密钥", "insecure": false},
+    "client": {"url": "https://10.0.0.8/", "key": "另一台的API访问密钥", "insecure": true}
+  },
+  "default": "work"
 }
 ```
+
+- `default` 是未指定 `--server` 时使用的服务器；不写则取配置里的第一台
+- 也兼容单服务器旧格式 `{"url": "...", "key": "...", "insecure": true}`，此时等价于名为 `default` 的服务器
 
 **方式三：调用时传参**
 
 ```bash
 python scripts/redmine.py --url https://redmine.example.com --key 你的KEY test
+python scripts/redmine.py --server client issues --status open
 ```
 
-> 自签名证书的服务器加 `--insecure`（或配置文件 `"insecure": true` / 环境变量 `REDMINE_INSECURE=1`）。
+> 优先级从高到低：`--url`/`--key` → `--server <名字>`（此时该服务器的配置优先于环境变量）→ 环境变量 → 配置文件。
+>
+> 自签名证书的服务器加 `--insecure`（或配置文件里该服务器的 `"insecure": true` / 环境变量 `REDMINE_INSECURE=1`）。
 >
 > ⚠️ 请勿把 API Key 写进代码、skill 目录或任何仓库。
 
@@ -74,7 +85,10 @@ python scripts/redmine.py --url https://redmine.example.com --key 你的KEY test
 ### 直接调用脚本
 
 ```bash
-python scripts/redmine.py test                                  # 验证连通性
+python scripts/redmine.py servers                               # 列出已配置的服务器（不联网）
+python scripts/redmine.py test                                  # 验证连通性（默认服务器）
+python scripts/redmine.py test --server client                  # 验证指定服务器
+python scripts/redmine.py --server client issues --status open  # 在指定服务器上查票
 python scripts/redmine.py projects                              # 列出项目
 python scripts/redmine.py issues --assignee me --status open    # 查我的 open 工单
 python scripts/redmine.py issue 123                             # 单票详情（含评论）
@@ -88,6 +102,8 @@ python scripts/redmine.py watch 123 --add me                    # 添加跟踪�
 python scripts/redmine.py watch 123 --remove zhangsan           # 移除跟踪者
 ```
 
+> `--server <名字>` 可放在命令任意位置。多台服务器下工单 id 可能重复，操作前先确认目标服务器（`servers` 看配置、`test` 看当前用户，或看返回的 URL 域名）。
+
 > 多行长评论 / 长描述（尤其含 ASCII 双引号时）不要拼进命令行 — PowerShell 5.1 会截断参数。写入 UTF-8 文本文件后用 `--notes-file 评论.txt`（评论）或 `--description-file 描述.txt`（描述）传入。
 
 ## 命令一览
@@ -95,6 +111,7 @@ python scripts/redmine.py watch 123 --remove zhangsan           # 移除跟踪�
 | 命令 | 用途 |
 |---|---|
 | `test` | 验证服务器与 API Key 连通性 |
+| `servers` | 列出配置文件里的服务器及默认项（不联网，不显示 Key） |
 | `projects` / `trackers` / `statuses` / `priorities` / `activities` | 列出项目与各类元数据 id |
 | `issues` | 查票，支持 `--project` `--status` `--assignee` `--tracker` `--priority` `--query` `--limit` `--sort` |
 | `issue <id>` | 单票详情（描述 + 评论历史） |
