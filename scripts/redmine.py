@@ -1,11 +1,14 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """Redmine CLI — 提票/回票/查票/更新状态/记工时（Redmine REST API，仅标准库）.
 
 凭据来源（优先级从高到低）：
   1. 命令行参数（位置任意）: --url https://redmine.example.com  --key <API访问密钥>
-  2. 环境变量: REDMINE_URL / REDMINE_API_KEY（自签名证书再加 REDMINE_INSECURE=1）
-  3. 配置文件: ~/.redmine/config.json — {"url": "...", "key": "...", "insecure": true}
+  2. --server <名字> 选中配置文件里的某个服务器（此时该服务器配置优先于环境变量）
+  3. 环境变量: REDMINE_URL / REDMINE_API_KEY（自签名证书再加 REDMINE_INSECURE=1）
+  4. 配置文件: ~/.redmine/config.json
+     {"servers": {"work": {"url": "...", "key": "...", "insecure": true}}, "default": "work"}
+     旧格式 {"url": "...", "key": "..."} 仍可用，等价于名为 default 的服务器
 """
 
 import argparse
@@ -40,15 +43,8 @@ def out(msg=""):
 
 class Redmine:
     def __init__(self, url, key, insecure=False):
-        if not url:
-            die("missing server URL — 传 --url <SERVER>、设置环境变量 REDMINE_URL，"
-                "或在 ~/.redmine/config.json 里配置 url")
-        if not key:
-            die("missing API key — 传 --key <KEY>、设置环境变量 REDMINE_API_KEY，"
-                "或在 ~/.redmine/config.json 里配置 key"
-                "（Redmine 网页端 我的账号 → API 访问密钥）")
-        self.base = url.rstrip("/")
-        self.key = key
+        self.base = (url or "").rstrip("/")
+        self.key = key or ""
         ctx = ssl.create_default_context()
         if insecure:
             ctx.check_hostname = False
@@ -59,6 +55,13 @@ class Redmine:
         )
 
     def req(self, method, path, params=None, payload=None):
+        if not self.base:
+            die("missing server URL — 传 --url <SERVER> 或 --server <名字>、设置环境变量 "
+                "REDMINE_URL，或在 %s 里配置" % config_path())
+        if not self.key:
+            die("missing API key — 传 --key <KEY>、设置环境变量 REDMINE_API_KEY，"
+                "或在 %s 里配置"
+                "（Redmine 网页端 我的账号 → API 访问密钥）" % config_path())
         url = self.base + path
         if params:
             url += "?" + urllib.parse.urlencode(params, doseq=True)
@@ -227,6 +230,25 @@ def cmd_test(rm, a):
     u = rm.req("GET", "/users/current.json").get("user", {})
     out("OK — 已连接 %s，当前用户: %s (id %s)"
         % (rm.base, u.get("name") or u.get("login"), u.get("id")))
+
+
+def cmd_servers(rm, a):
+    profiles, default = config_profiles(load_config())
+    if not profiles:
+        out("未配置任何服务器 — 在 %s 里写：\n"
+            '  {"servers": {"work": {"url": "https://...", "key": "<API Key>"}}, "default": "work"}'
+            % config_path())
+        return
+    out("已配置 %d 个服务器（默认: %s，配置文件: %s）:"
+        % (len(profiles), default or "-", config_path()))
+    for name in sorted(profiles):
+        p = profiles[name]
+        out("  %s %s  url: %s  key: %s%s"
+            % ("*" if name == default else " ", name,
+               p.get("url") or "-",
+               "已配置" if p.get("key") else "缺失",
+               "  [insecure]" if p.get("insecure") else ""))
+    out("切换: 加 --server <名字>；未指定时用 default（非 --server 场景下环境变量 REDMINE_URL/REDMINE_API_KEY 优先）")
 
 
 def cmd_projects(rm, a):
@@ -549,12 +571,16 @@ def build_parser():
     p = argparse.ArgumentParser(
         prog="redmine.py",
         description="Redmine 命令行 — 提票/回票/查票/更新状态/记工时"
-                    "（凭据: --url/--key 任意位置，或环境变量 REDMINE_URL/REDMINE_API_KEY）")
+                    "（凭据: --url/--key、--server <名字> 任意位置，"
+                    "或环境变量 REDMINE_URL/REDMINE_API_KEY，或 ~/.redmine/config.json）")
     sub = p.add_subparsers(dest="cmd", metavar="command")
     sub.required = True
 
     s = sub.add_parser("test", help="验证服务器与 API key")
     s.set_defaults(func=cmd_test)
+
+    s = sub.add_parser("servers", help="列出配置文件中的服务器（不联网，不显示 key）")
+    s.set_defaults(func=cmd_servers)
 
     for name, func, help_ in (
             ("projects", cmd_projects, "列出项目"),
@@ -657,20 +683,45 @@ def build_parser():
     return p
 
 
+def config_path():
+    return os.path.join(os.path.expanduser("~"), ".redmine", "config.json")
+
+
 def load_config():
     """读取 ~/.redmine/config.json（存在时），用于凭据持久化配置。"""
-    path = os.path.join(os.path.expanduser("~"), ".redmine", "config.json")
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        # utf-8-sig: 兼容记事本等编辑器写入的 BOM
+        with open(config_path(), "r", encoding="utf-8-sig") as f:
             cfg = json.load(f)
     except (OSError, ValueError):
         return {}
     return cfg if isinstance(cfg, dict) else {}
 
 
+def config_profiles(cfg):
+    """把配置归一化为 ({名字: {url,key,insecure}}, 默认名字)。
+
+    - 新格式: {"servers": {"work": {...}}, "default": "work"}
+    - 旧格式: {"url": ..., "key": ...} 视为名为 default 的服务器
+    """
+    profiles = {}
+    servers = cfg.get("servers")
+    if isinstance(servers, dict):
+        for name, item in servers.items():
+            if isinstance(item, dict):
+                profiles[str(name)] = item
+    legacy = {k: cfg[k] for k in ("url", "key", "insecure") if k in cfg}
+    if legacy:
+        profiles.setdefault("default", legacy)
+    default = cfg.get("default")
+    if default not in profiles:
+        default = "default" if "default" in profiles else next(iter(profiles), None)
+    return profiles, default
+
+
 def extract_globals(argv):
-    """把 --url/--key/--insecure 从任意位置抽出来，交给环境变量逻辑合并。"""
-    url = key = None
+    """把 --url/--key/--server/--insecure 从任意位置抽出来，交给凭据合并逻辑。"""
+    url = key = server = None
     insecure = False
     rest = []
     i = 0
@@ -680,26 +731,44 @@ def extract_globals(argv):
             url = argv[i + 1]; i += 2
         elif t == "--key" and i + 1 < len(argv):
             key = argv[i + 1]; i += 2
+        elif t == "--server" and i + 1 < len(argv):
+            server = argv[i + 1]; i += 2
         elif t == "--insecure":
             insecure = True; i += 1
         elif t.startswith("--url="):
             url = t.split("=", 1)[1]; i += 1
         elif t.startswith("--key="):
             key = t.split("=", 1)[1]; i += 1
+        elif t.startswith("--server="):
+            server = t.split("=", 1)[1]; i += 1
         else:
             rest.append(t); i += 1
-    return url, key, insecure, rest
+    return url, key, server, insecure, rest
 
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
-    url, key, insecure, rest = extract_globals(argv)
+    url, key, server, insecure, rest = extract_globals(argv)
     a = build_parser().parse_args(rest)
-    cfg = load_config()
+    profiles, default = config_profiles(load_config())
+    env_url = os.environ.get("REDMINE_URL")
+    env_key = os.environ.get("REDMINE_API_KEY")
     env_insecure = os.environ.get("REDMINE_INSECURE", "").strip().lower() in ("1", "true", "yes")
-    rm = Redmine(url or os.environ.get("REDMINE_URL") or cfg.get("url"),
-                 key or os.environ.get("REDMINE_API_KEY") or cfg.get("key"),
-                 insecure or env_insecure or bool(cfg.get("insecure")))
+    if server:
+        if server not in profiles:
+            die("未知服务器 %r — 已配置: %s（运行 servers 查看）"
+                % (server, "、".join(sorted(profiles)) or "（无）"))
+        p = profiles[server]
+        # 显式 --server 时，该服务器配置优先于环境变量
+        url = url or p.get("url") or env_url
+        key = key or p.get("key") or env_key
+        insecure = insecure or bool(p.get("insecure")) or env_insecure
+    else:
+        p = profiles.get(default) or {}
+        url = url or env_url or p.get("url")
+        key = key or env_key or p.get("key")
+        insecure = insecure or env_insecure or bool(p.get("insecure"))
+    rm = Redmine(url, key, insecure)
     try:
         a.func(rm, a)
     except RedmineError as e:
