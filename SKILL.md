@@ -18,8 +18,9 @@ description: File, query, reply to, and update Redmine issues and log time via R
 ```json
 {
   "servers": {
-    "work":   {"url": "https://redmine.example.com", "key": "...", "insecure": true},
-    "client": {"url": "https://10.0.0.8/", "key": "..."}
+    "work":   {"url": "https://redmine.example.com", "key": "...", "insecure": true, "mode": "readwrite"},
+    "client": {"url": "https://10.0.0.8/", "key": "...", "mode": "readonly"},
+    "test":   {"url": "https://redmine-test.example.com", "key": "...", "mode": "confirm"}
   },
   "default": "work"
 }
@@ -29,20 +30,36 @@ description: File, query, reply to, and update Redmine issues and log time via R
 
 全都没有就向用户索要；API Key 在 Redmine 网页端「我的账号 → API 访问密钥」获取。不要把 key 写进 skill 目录、仓库或代码；输出时避免完整复述。需要新增/切换服务器时让用户自己改配置文件，引导他为每台服务器起一个短名字。
 
+## 写权限（mode）
+
+每台服务器可配置 `mode`，脚本在发出写请求前强制拦截，不依赖 AI 自觉：
+
+| 取值 | 含义 |
+|---|---|
+| `readonly` | 只读。`create` / `update` / `note` / `close` / `log` / `attach` / `watch` 直接拒绝，非 0 退出码（2），不会发出任何写请求 |
+| `confirm` | 弱可读写。写命令只输出变更预览并以退出码 3 结束；加 `--confirm` 重跑才真正提交 |
+| `readwrite` | 可读写，不额外拦截（缺省） |
+
+- 只读命令不受限制：`test`、`servers`、`projects`、`trackers`、`statuses`、`priorities`、`activities`、`issues`、`issue`、`search`、`watchers`
+- 可用 `--mode <取值>` 或环境变量 `REDMINE_MODE` 临时覆盖，优先级与 `url`/`key` 一致
+- **遇到 `readonly` 服务器**：不要尝试任何写操作，直接告知用户该服务器只读；需要修改就请用户提供可写服务器
+- **遇到 `confirm` 服务器**：先原样执行一次写命令拿到预览（退出码 3），把预览内容（服务器、工单、新旧值、评论、附件）展示给用户并征求同意，用户确认后**加 `--confirm` 重跑同一条命令**
+- 退出码：`0` 成功 / `1` 一般错误 / `2` readonly 拒绝 / `3` confirm 待确认
+
 ## 调用
 
 ```
-python <skill目录>/scripts/redmine.py [--server 名字 | --url ... --key ...] <command> [options]
+python <skill目录>/scripts/redmine.py [--server 名字 | --url ... --key ...] [--mode readonly|readwrite|confirm] <command> [options] [--confirm]
 ```
 
-Windows 下 `python` 不可用时改用 `py`。自签名证书服务器加 `--insecure`（或配置文件里该服务器的 `"insecure": true` / 环境变量 `REDMINE_INSECURE=1` 持久化）。
+Windows 下 `python` 不可用时改用 `py`。自签名证书服务器加 `--insecure`（或配置文件里该服务器的 `"insecure": true` / 环境变量 `REDMINE_INSECURE=1` 持久化）。`--mode` / `--confirm` 也可放在命令任意位置。
 
 ## 命令
 
 | 命令 | 用途 |
 |---|---|
 | `test` | 验证连通性，显示当前用户 |
-| `servers` | 列出配置文件里的服务器及默认项（不联网，不显示 key） |
+| `servers` | 列出配置文件里的服务器、默认项与各台的写权限 mode（不联网，不显示 key） |
 | `projects` / `trackers` / `statuses` / `priorities` / `activities` | 列出元数据 id 与名称 |
 | `issues [--project P] [--status S] [--assignee A] [--tracker T] [--priority P] [--query Q] [--limit N] [--sort updated_on:desc]` | 查票；`--status` 支持 open/closed/all/名称/id，默认只列 open |
 | `issue <id>` | 单票详情（描述 + 评论历史） |
@@ -94,6 +111,7 @@ Redmine 默认使用 Textile 格式（不是 Markdown）。回票评论与工单
 
 - create/update/close 后把 `<server>/issues/<id>` 链接展示给用户。
 - 多台服务器下工单 id 会重复：动票前先确认针对的是哪台（`servers` 看配置、`test` 看当前用户，或直接看返回的 URL 域名），不确定就问用户；一次调用只作用于一台服务器。
+- 写命令被 `readonly` 拒绝（退出码 2）时不要绕过，直接告知用户该服务器只读；被 `confirm` 拦下（退出码 3）时把预览展示给用户，确认后加 `--confirm` 重跑。
 - HTTP 422 是字段校验失败，Redmine 会列出错误字段 — 原样转告用户后修正参数，不要盲目重试。
 - 错误输出以 `ERROR:` 开头（stderr）。`issues` / `issue` 加 `--json` 可取原始数据。
 - 批量或破坏性操作（关单、删改多条）先向用户确认。
