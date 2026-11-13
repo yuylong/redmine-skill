@@ -7,8 +7,15 @@
   2. --server <名字> 选中配置文件里的某个服务器（此时该服务器配置优先于环境变量）
   3. 环境变量: REDMINE_URL / REDMINE_API_KEY（自签名证书再加 REDMINE_INSECURE=1）
   4. 配置文件: ~/.redmine/config.json
-     {"servers": {"work": {"url": "...", "key": "...", "insecure": true}}, "default": "work"}
+     {"servers": {"work": {"url": "...", "key": "...", "insecure": true,
+                           "mode": "readwrite"}}, "default": "work"}
      旧格式 {"url": "...", "key": "..."} 仍可用，等价于名为 default 的服务器
+
+写权限 mode（按服务器配置，缺省 readwrite）：
+  readonly   只读，所有写命令直接拒绝（退出码 2），不发任何写请求
+  confirm    弱可读写，写命令先输出变更预览并以退出码 3 结束，加 --confirm 才真正提交
+  readwrite  可读写，不做额外拦截
+可用 --mode 或环境变量 REDMINE_MODE 覆盖，优先级与 url/key 一致。
 """
 
 import argparse
@@ -41,10 +48,92 @@ def out(msg=""):
     print(msg)
 
 
+MODE_READONLY = "readonly"
+MODE_READWRITE = "readwrite"
+MODE_CONFIRM = "confirm"
+VALID_MODES = (MODE_READONLY, MODE_READWRITE, MODE_CONFIRM)
+
+WRITE_COMMAND_LABELS = {
+    "create": "create（提票）",
+    "update": "update（更新工单）",
+    "note": "note（回票）",
+    "close": "close（关单）",
+    "log": "log（记工时）",
+    "attach": "attach（上传附件）",
+    "watch": "watch（增删跟踪者）",
+}
+
+
+def normalize_mode(value):
+    """归一化为 readonly / readwrite / confirm，缺省 readwrite。"""
+    v = str(value or "").strip().lower()
+    if not v:
+        return MODE_READWRITE
+    if v not in VALID_MODES:
+        die("无效 mode %r — 可选: %s" % (value, " / ".join(VALID_MODES)))
+    return v
+
+
+def ensure_writable(rm, cmd):
+    """readonly 服务器在发出任何写请求前直接拒绝（退出码 2）。"""
+    if rm.mode == MODE_READONLY:
+        print("[拒绝] 服务器 %s 为 readonly 模式，不允许执行 %s"
+              % (rm.server_name or "-", WRITE_COMMAND_LABELS.get(cmd, cmd)),
+              file=sys.stderr)
+        sys.exit(2)
+
+
+def confirm_gate(rm, cmd, confirm, preview_lines):
+    """confirm 模式且未带 --confirm 时，只输出变更预览并以退出码 3 结束。"""
+    if rm.mode != MODE_CONFIRM or confirm:
+        return
+    out("[待确认] 服务器 %s 为 confirm 模式，即将执行 %s："
+        % (rm.server_name or "-", WRITE_COMMAND_LABELS.get(cmd, cmd)))
+    out("  服务器: %s  %s" % (rm.server_name or "-", rm.base))
+    for line in preview_lines:
+        out("  " + line)
+    out("确认无误后请加 --confirm 重新执行")
+    sys.exit(3)
+
+
+def name_of(items, item_id):
+    """按 id 反查名称，用于预览展示。"""
+    for it in items:
+        if it.get("id") == item_id:
+            return str(it.get("name"))
+    return str(item_id)
+
+
+def old_value(cur, key):
+    """取工单当前字段值（预览里的「旧值」）。"""
+    if not cur:
+        return "?"
+    v = cur.get(key)
+    if isinstance(v, dict):
+        return str(v.get("name") or v.get("id") or "-")
+    if v is None:
+        return "-"
+    return str(v)
+
+
+def short_text(text, limit=40):
+    """预览里压缩长文本：只留首行，超出加省略号并提示总行数。"""
+    s = str(text if text is not None else "").strip()
+    if not s:
+        return "(空)"
+    lines = s.splitlines()
+    first = lines[0]
+    if len(first) > limit:
+        first = first[:limit] + "…"
+    return first + ("（共 %d 行）" % len(lines) if len(lines) > 1 else "")
+
+
 class Redmine:
-    def __init__(self, url, key, insecure=False):
+    def __init__(self, url, key, insecure=False, mode=MODE_READWRITE, server_name=None):
         self.base = (url or "").rstrip("/")
         self.key = key or ""
+        self.mode = mode
+        self.server_name = server_name
         ctx = ssl.create_default_context()
         if insecure:
             ctx.check_hostname = False
@@ -243,12 +332,14 @@ def cmd_servers(rm, a):
         % (len(profiles), default or "-", config_path()))
     for name in sorted(profiles):
         p = profiles[name]
-        out("  %s %s  url: %s  key: %s%s"
+        out("  %s %s  url: %s  key: %s  mode: %s%s"
             % ("*" if name == default else " ", name,
                p.get("url") or "-",
                "已配置" if p.get("key") else "缺失",
+               normalize_mode(p.get("mode")),
                "  [insecure]" if p.get("insecure") else ""))
     out("切换: 加 --server <名字>；未指定时用 default（非 --server 场景下环境变量 REDMINE_URL/REDMINE_API_KEY 优先）")
+    out("mode: readonly 只读 / confirm 每次写操作需加 --confirm / readwrite 可读写（缺省）")
 
 
 def cmd_projects(rm, a):
@@ -380,6 +471,7 @@ def guess_tracker(rm, subject, description):
 
 
 def cmd_create(rm, a):
+    ensure_writable(rm, "create")
     issue = {"project_id": resolve_project(rm, a.project), "subject": a.subject}
     if a.description and a.description_file:
         die("--description 与 --description-file 只能用一个")
@@ -389,7 +481,9 @@ def cmd_create(rm, a):
         issue["description"] = read_text_file(a.description_file, "描述")
     tracker_name = None
     if a.tracker:
-        issue["tracker_id"] = match_name(list_trackers(rm), a.tracker, "跟踪类型")
+        trackers = list_trackers(rm)
+        issue["tracker_id"] = match_name(trackers, a.tracker, "跟踪类型")
+        tracker_name = name_of(trackers, issue["tracker_id"])
     else:
         tid, tracker_name = guess_tracker(rm, a.subject, issue.get("description"))
         if tid:
@@ -400,6 +494,20 @@ def cmd_create(rm, a):
         issue["assigned_to_id"] = resolve_assignee(rm, a.assignee)
     if a.status:
         issue["status_id"] = match_name(list_statuses(rm), a.status, "状态")
+    preview = [
+        "项目: %s（#%s）" % (a.project, issue["project_id"]),
+        "标题: %s" % issue["subject"],
+        "跟踪: %s" % (tracker_name or "-"),
+    ]
+    if "priority_id" in issue:
+        preview.append("优先级: %s" % a.priority)
+    if "assigned_to_id" in issue:
+        preview.append("负责人: %s（id %s）" % (a.assignee, issue["assigned_to_id"]))
+    if "status_id" in issue:
+        preview.append("状态: %s" % a.status)
+    if "description" in issue:
+        preview.append("描述: %s" % short_text(issue["description"]))
+    confirm_gate(rm, "create", a.confirm, preview)
     data = rm.req("POST", "/issues.json", payload={"issue": issue})
     i = data.get("issue", {})
     tname = (i.get("tracker") or {}).get("name") or tracker_name
@@ -437,37 +545,66 @@ def read_text_file(path, label):
 
 
 def cmd_update(rm, a):
+    ensure_writable(rm, "update")
+    # 仅 confirm 预览时多取一次当前工单，用于展示字段新旧值
+    cur = None
+    if rm.mode == MODE_CONFIRM and not a.confirm:
+        cur = rm.req("GET", "/issues/%s.json" % a.id).get("issue", {})
     issue = {}
+    changes = []
     if a.status:
-        issue["status_id"] = match_name(list_statuses(rm), a.status, "状态")
+        statuses = list_statuses(rm)
+        sid = match_name(statuses, a.status, "状态")
+        issue["status_id"] = sid
+        changes.append(("状态", old_value(cur, "status"), name_of(statuses, sid)))
     if a.tracker:
-        issue["tracker_id"] = match_name(list_trackers(rm), a.tracker, "跟踪类型")
+        trackers = list_trackers(rm)
+        tid = match_name(trackers, a.tracker, "跟踪类型")
+        issue["tracker_id"] = tid
+        changes.append(("跟踪", old_value(cur, "tracker"), name_of(trackers, tid)))
     if a.priority:
-        issue["priority_id"] = match_name(list_priorities(rm), a.priority, "优先级")
+        priorities = list_priorities(rm)
+        pid = match_name(priorities, a.priority, "优先级")
+        issue["priority_id"] = pid
+        changes.append(("优先级", old_value(cur, "priority"), name_of(priorities, pid)))
     if a.assignee:
-        issue["assigned_to_id"] = resolve_assignee(rm, a.assignee)
+        uid = resolve_assignee(rm, a.assignee)
+        issue["assigned_to_id"] = uid
+        changes.append(("负责人", old_value(cur, "assigned_to"), "%s（id %s）" % (a.assignee, uid)))
     if a.progress is not None:
         if not 0 <= a.progress <= 100:
             die("--progress 取值 0-100")
         issue["done_ratio"] = a.progress
+        changes.append(("进度", old_value(cur, "done_ratio"), "%s%%" % a.progress))
     if a.subject:
         issue["subject"] = a.subject
+        changes.append(("标题", old_value(cur, "subject"), a.subject))
     if a.description and a.description_file:
         die("--description 与 --description-file 只能用一个")
     if a.description is not None:
         issue["description"] = a.description
+        changes.append(("描述", short_text(old_value(cur, "description")), short_text(a.description)))
     elif a.description_file:
-        issue["description"] = read_text_file(a.description_file, "描述")
+        text = read_text_file(a.description_file, "描述")
+        issue["description"] = text
+        changes.append(("描述", short_text(old_value(cur, "description")), short_text(text)))
     if a.notes and a.notes_file:
         die("-m 与 --notes-file 只能用一个")
-    if a.notes:
-        issue["notes"] = a.notes
-    elif a.notes_file:
-        issue["notes"] = read_text_file(a.notes_file, "评论")
+    notes = a.notes
+    if not notes and a.notes_file:
+        notes = read_text_file(a.notes_file, "评论")
+    if notes:
+        issue["notes"] = notes
+        changes.append(("评论", "-", short_text(notes)))
     if a.file:
-        issue["uploads"] = upload_tokens(rm, a.file)
+        changes.append(("附件", "-", "、".join(os.path.basename(p) for p in a.file)))
     if not issue:
         die("没有要更新的字段 — 至少传一个（--status/--notes/--priority/--assignee/--progress/--subject/--description/--tracker/--file）")
+    confirm_gate(rm, "update", a.confirm,
+                 ["工单: #%s %s" % (a.id, (cur or {}).get("subject", ""))]
+                 + ["%s: %s → %s" % (label, old, new) for label, old, new in changes])
+    if a.file:
+        issue["uploads"] = upload_tokens(rm, a.file)
     rm.req("PUT", "/issues/%s.json" % a.id, payload={"issue": issue})
     extra = []
     if a.notes:
@@ -478,6 +615,7 @@ def cmd_update(rm, a):
 
 
 def cmd_note(rm, a):
+    ensure_writable(rm, "note")
     notes = a.notes
     if a.notes_file:
         if notes:
@@ -485,6 +623,10 @@ def cmd_note(rm, a):
         notes = read_text_file(a.notes_file, "评论")
     if not notes or not notes.strip():
         die("评论内容为空 — 用 -m 短评论或 --notes-file 文件提供")
+    preview = ["工单: #%s" % a.id, "评论: %s" % short_text(notes)]
+    if a.file:
+        preview.append("附件: %s" % "、".join(os.path.basename(p) for p in a.file))
+    confirm_gate(rm, "note", a.confirm, preview)
     issue = {"notes": notes}
     if a.file:
         issue["uploads"] = upload_tokens(rm, a.file)
@@ -498,13 +640,19 @@ def cmd_note(rm, a):
 
 
 def cmd_close(rm, a):
+    ensure_writable(rm, "close")
+    statuses = list_statuses(rm)
     if a.status:
-        sid = match_name(list_statuses(rm), a.status, "状态")
+        sid = match_name(statuses, a.status, "状态")
     else:
-        closed = [s for s in list_statuses(rm) if s.get("is_closed")]
+        closed = [s for s in statuses if s.get("is_closed")]
         if not closed:
             die("服务器未定义任何关闭态状态 — 用 update --status <名称> 指定")
         sid = closed[0]["id"]
+    preview = ["工单: #%s" % a.id, "状态: %s" % name_of(statuses, sid)]
+    if a.notes:
+        preview.append("评论: %s" % short_text(a.notes))
+    confirm_gate(rm, "close", a.confirm, preview)
     issue = {"status_id": sid}
     if a.notes:
         issue["notes"] = a.notes
@@ -513,23 +661,45 @@ def cmd_close(rm, a):
 
 
 def cmd_log(rm, a):
+    ensure_writable(rm, "log")
     entry = {"issue_id": as_int(a.id), "hours": a.hours}
+    activity_name = None
     if a.activity:
-        entry["activity_id"] = match_name(list_activities(rm), a.activity, "工时活动")
+        acts = list_activities(rm)
+        entry["activity_id"] = match_name(acts, a.activity, "工时活动")
+        activity_name = name_of(acts, entry["activity_id"])
     else:
         acts = list_activities(rm)
         default = next((x for x in acts if x.get("is_default")), acts[0] if acts else None)
         if default:
             entry["activity_id"] = default["id"]
+            activity_name = default.get("name")
     if a.comments:
         entry["comments"] = a.comments
     if a.spent_on:
         entry["spent_on"] = a.spent_on
+    preview = ["工单: #%s" % a.id,
+               "工时: %s 小时" % a.hours,
+               "活动: %s" % (activity_name or "-")]
+    if a.comments:
+        preview.append("说明: %s" % short_text(a.comments))
+    if a.spent_on:
+        preview.append("日期: %s" % a.spent_on)
+    confirm_gate(rm, "log", a.confirm, preview)
     rm.req("POST", "/time_entries.json", payload={"time_entry": entry})
     out("已给工单 #%s 记录工时 %s 小时" % (a.id, a.hours))
 
 
 def cmd_attach(rm, a):
+    ensure_writable(rm, "attach")
+    if not os.path.isfile(a.file):
+        die("文件不存在: %s" % a.file)
+    name = a.name or os.path.basename(a.file)
+    preview = ["工单: #%s" % a.id,
+               "附件: %s（%d 字节）" % (name, os.path.getsize(a.file))]
+    if a.description:
+        preview.append("说明: %s" % short_text(a.description))
+    confirm_gate(rm, "attach", a.confirm, preview)
     entry = upload_tokens(rm, [a.file])[0]
     if a.name:
         entry["filename"] = a.name
@@ -553,8 +723,15 @@ def cmd_watchers(rm, a):
 
 
 def cmd_watch(rm, a):
+    ensure_writable(rm, "watch")
     if not a.add and not a.remove:
         die("请指定操作 — --add 添加跟踪者 / --remove 移除跟踪者（me / 用户id / 姓名）")
+    preview = ["工单: #%s" % a.id]
+    if a.add:
+        preview.append("添加跟踪者: %s" % a.add)
+    if a.remove:
+        preview.append("移除跟踪者: %s" % a.remove)
+    confirm_gate(rm, "watch", a.confirm, preview)
     if a.add:
         uid = resolve_assignee(rm, a.add)
         rm.req("POST", "/issues/%s/watchers.json" % a.id, payload={"user_id": uid})
@@ -572,7 +749,9 @@ def build_parser():
         prog="redmine.py",
         description="Redmine 命令行 — 提票/回票/查票/更新状态/记工时"
                     "（凭据: --url/--key、--server <名字> 任意位置，"
-                    "或环境变量 REDMINE_URL/REDMINE_API_KEY，或 ~/.redmine/config.json）")
+                    "或环境变量 REDMINE_URL/REDMINE_API_KEY，或 ~/.redmine/config.json；"
+                    "写权限: --mode readonly/readwrite/confirm 或 REDMINE_MODE，"
+                    "confirm 模式的写命令需加 --confirm 才真正提交）")
     sub = p.add_subparsers(dest="cmd", metavar="command")
     sub.required = True
 
@@ -720,9 +899,10 @@ def config_profiles(cfg):
 
 
 def extract_globals(argv):
-    """把 --url/--key/--server/--insecure 从任意位置抽出来，交给凭据合并逻辑。"""
-    url = key = server = None
+    """把 --url/--key/--server/--mode/--insecure/--confirm 从任意位置抽出来。"""
+    url = key = server = mode = None
     insecure = False
+    confirm = False
     rest = []
     i = 0
     while i < len(argv):
@@ -733,26 +913,34 @@ def extract_globals(argv):
             key = argv[i + 1]; i += 2
         elif t == "--server" and i + 1 < len(argv):
             server = argv[i + 1]; i += 2
+        elif t == "--mode" and i + 1 < len(argv):
+            mode = argv[i + 1]; i += 2
         elif t == "--insecure":
             insecure = True; i += 1
+        elif t == "--confirm":
+            confirm = True; i += 1
         elif t.startswith("--url="):
             url = t.split("=", 1)[1]; i += 1
         elif t.startswith("--key="):
             key = t.split("=", 1)[1]; i += 1
         elif t.startswith("--server="):
             server = t.split("=", 1)[1]; i += 1
+        elif t.startswith("--mode="):
+            mode = t.split("=", 1)[1]; i += 1
         else:
             rest.append(t); i += 1
-    return url, key, server, insecure, rest
+    return url, key, server, insecure, mode, confirm, rest
 
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
-    url, key, server, insecure, rest = extract_globals(argv)
+    url, key, server, insecure, cli_mode, confirm, rest = extract_globals(argv)
     a = build_parser().parse_args(rest)
+    a.confirm = confirm
     profiles, default = config_profiles(load_config())
     env_url = os.environ.get("REDMINE_URL")
     env_key = os.environ.get("REDMINE_API_KEY")
+    env_mode = os.environ.get("REDMINE_MODE")
     env_insecure = os.environ.get("REDMINE_INSECURE", "").strip().lower() in ("1", "true", "yes")
     if server:
         if server not in profiles:
@@ -763,12 +951,16 @@ def main(argv=None):
         url = url or p.get("url") or env_url
         key = key or p.get("key") or env_key
         insecure = insecure or bool(p.get("insecure")) or env_insecure
+        mode = cli_mode or p.get("mode") or env_mode
+        server_name = server
     else:
         p = profiles.get(default) or {}
         url = url or env_url or p.get("url")
         key = key or env_key or p.get("key")
         insecure = insecure or env_insecure or bool(p.get("insecure"))
-    rm = Redmine(url, key, insecure)
+        mode = cli_mode or env_mode or p.get("mode")
+        server_name = default
+    rm = Redmine(url, key, insecure, normalize_mode(mode), server_name)
     try:
         a.func(rm, a)
     except RedmineError as e:
