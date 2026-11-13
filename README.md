@@ -15,6 +15,7 @@
 - 兼容自签名证书服务器（`--insecure`）
 - 凭据支持 命令行参数 / 环境变量 / 配置文件 三种方式，密钥不落盘到代码与仓库
 - **支持多台 Redmine 服务器**：配置文件里按名字保存多套地址与密钥，`--server <名字>` 一键切换，`servers` 命令查看已配置项
+- **按服务器配置写权限**：`mode` 可取 `readonly`（只读，写命令直接拒绝）/ `confirm`（每次写操作先预览、加 `--confirm` 才提交）/ `readwrite`（缺省），脚本层面强制拦截，不依赖 AI 自觉
 
 ## 安装
 
@@ -46,15 +47,37 @@ export REDMINE_API_KEY="你的API访问密钥"
 ```json
 {
   "servers": {
-    "work":   {"url": "https://redmine.example.com", "key": "你的API访问密钥", "insecure": false},
-    "client": {"url": "https://10.0.0.8/", "key": "另一台的API访问密钥", "insecure": true}
+    "work":   {"url": "https://redmine.example.com", "key": "你的API访问密钥", "mode": "readwrite"},
+    "client": {"url": "https://10.0.0.8/", "key": "另一台的API访问密钥", "insecure": true, "mode": "readonly"},
+    "test":   {"url": "https://redmine-test.example.com", "key": "测试环境的API访问密钥", "mode": "confirm"}
   },
   "default": "work"
 }
 ```
 
 - `default` 是未指定 `--server` 时使用的服务器；不写则取配置里的第一台
+- `mode` 是这台服务器的写权限，缺省 `readwrite`
 - 也兼容单服务器旧格式 `{"url": "...", "key": "...", "insecure": true}`，此时等价于名为 `default` 的服务器
+
+### 写权限（mode）
+
+脚本在真正发出写请求前做强制拦截，避免客户生产环境被误改：
+
+| 取值 | 含义 | 行为 |
+|---|---|---|
+| `readonly` | 只读 | `create` / `update` / `note` / `close` / `log` / `attach` / `watch` 直接拒绝，退出码 `2`，不发任何写请求 |
+| `confirm` | 弱可读写 | 先输出变更预览（服务器、工单、字段新旧值、评论、附件），退出码 `3`；加 `--confirm` 重跑才真正提交 |
+| `readwrite` | 可读写 | 不做额外拦截（缺省） |
+
+只读命令（`test` / `servers` / `projects` / `trackers` / `statuses` / `priorities` / `activities` / `issues` / `issue` / `search` / `watchers`）在任何 mode 下都可用。
+
+临时覆盖用 `--mode <取值>` 或环境变量 `REDMINE_MODE`，优先级与 `url` / `key` 一致：
+
+```bash
+python scripts/redmine.py --mode readonly --server client issues --status open
+python scripts/redmine.py --mode confirm --server client note 123 -m "已修复"
+python scripts/redmine.py --mode confirm --server client note 123 -m "已修复" --confirm   # 真正提交
+```
 
 **方式三：调用时传参**
 
@@ -85,7 +108,7 @@ python scripts/redmine.py --server client issues --status open
 ### 直接调用脚本
 
 ```bash
-python scripts/redmine.py servers                               # 列出已配置的服务器（不联网）
+python scripts/redmine.py servers                               # 列出已配置的服务器与 mode（不联网）
 python scripts/redmine.py test                                  # 验证连通性（默认服务器）
 python scripts/redmine.py test --server client                  # 验证指定服务器
 python scripts/redmine.py --server client issues --status open  # 在指定服务器上查票
@@ -111,7 +134,7 @@ python scripts/redmine.py watch 123 --remove zhangsan           # 移除跟踪�
 | 命令 | 用途 |
 |---|---|
 | `test` | 验证服务器与 API Key 连通性 |
-| `servers` | 列出配置文件里的服务器及默认项（不联网，不显示 Key） |
+| `servers` | 列出配置文件里的服务器、默认项与各台写权限 mode（不联网，不显示 Key） |
 | `projects` / `trackers` / `statuses` / `priorities` / `activities` | 列出项目与各类元数据 id |
 | `issues` | 查票，支持 `--project` `--status` `--assignee` `--tracker` `--priority` `--query` `--limit` `--sort` |
 | `issue <id>` | 单票详情（描述 + 评论历史） |
@@ -130,6 +153,7 @@ python scripts/redmine.py watch 123 --remove zhangsan           # 移除跟踪�
 - Redmine 工单默认使用 **Textile** 格式（不是 Markdown），回票与描述请使用 Textile 语法（`h3. 标题`、`*粗体*`、`"链接":https://...`）
 - 排版硬性规则：加粗 / 斜体标记前后各留一个空格（`这个 **重点** 要注意`，不要写 `这个**重点**要注意`）；`h2.` / `h3.` 等标题行前后各留一个空行。否则 Redmine 会把星号原样显示，或把标题并入上一段
 - HTTP 422 表示字段校验失败，服务器会列出错误字段，按提示修正参数即可
+- 退出码：`0` 成功 / `1` 一般错误 / `2` readonly 拒绝 / `3` confirm 待确认
 - 批量或破坏性操作（关单、批量修改）请先与用户确认
 
 ## License
